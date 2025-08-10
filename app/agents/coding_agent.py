@@ -9,43 +9,53 @@ class CodeGenError(Exception):
     pass
 
 
-async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | None = None, mode: str = "code") -> str:
+async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | None = None, mode: str = "code", feedback: str | None = None) -> str:
+    """Generate code for a task, optionally incorporating feedback from previous attempts."""
+    
     # Build mode-specific system prompt
     if mode == "source":
         sys = dedent(
             """
             You are a senior data engineer. Generate a single, self-contained Python script that:
             - SOURCES data only (do not answer the user's questions here).
-            - Reads 'questions_txt' and any provided attachments from a provided dict attachments: Dict[str, bytes]
-            - If URLs are referenced, fetch the full HTML/text content (use a proper User-Agent) without assuming table names/structure before scraping.
-            - If files are attached, read them fully (text or tabular via pandas); include raw bytes/text as needed.
-            - If a database schema is provided, issue targeted SELECT queries for only relevant columns/rows (avoid scanning entire DB).
-            - Return a SINGLE JSON object mapping source names to their full contents (strings for HTML/text; arrays/objects for tables); print ONLY this JSON to stdout.
-            - Do not require external API keys.
+            - Uses the injected variables: attachments (Dict[str, bytes]) and questions_txt (str).
+            - If URLs are referenced in questions_txt, download the full HTML/text content using requests/httpx with proper User-Agent headers.
+            - If files are in attachments, read them fully (text files as strings; tabular files with pandas including raw text).
+            - If S3 URLs or cloud storage paths are mentioned, use s3fs which is available in the environment.
+            - If database schema/connection info is provided, execute targeted SELECT queries for only relevant columns/rows.
+            - Return a SINGLE JSON object mapping source names to their full contents (strings for HTML/text; arrays/objects for tables).
+            - Print ONLY this JSON object to stdout.
+            - Available libraries: requests, httpx, pandas, s3fs, duckdb, pyarrow, bs4, lxml
+            - No external API keys required (except for standard web access).
             - Enforce a 90s overall runtime; be efficient.
+            
             Implementation tips:
-            - Use requests/httpx with timeouts and headers.
-            - For robustness, handle redirects/HTTP failures gracefully and include error strings in the JSON if a source fails.
+            - Use requests with timeouts and headers: {'User-Agent': 'Mozilla/5.0 (compatible; DataBot/1.0)'}
+            - Handle redirects and HTTP failures gracefully, include error messages in JSON if sources fail.
+            - For robustness, wrap each data source fetch in try-except blocks.
             """
         )
     else:
         sys = dedent(
             """
             You are a senior data engineer. Generate a single, self-contained Python script that:
-            - Uses the injected variables sourced_data (JSON-like), attachments (Dict[str, bytes]), and questions_txt (str).
-            - Treat sourced_data as the PRIMARY data context; DO NOT perform any network calls or re-fetch data when sourced_data exists.
-            - Do not attempt to read from files, stdin, special file descriptors, or environment variables provided by the runner; rely only on the injected variables above.
-            - Uses libraries: pandas, numpy, matplotlib, bs4, lxml, duckdb/pyarrow when needed
-            - Produces exactly the final answers in the requested format (JSON array/object). If a plot is requested, return base64 data URI under 100kB.
+            - Uses the injected variables: attachments (Dict[str, bytes]) and questions_txt (str).
+            - If URLs are mentioned in questions_txt, fetch them using requests/httpx with proper headers and timeouts.
+            - If files are in attachments, read and process them (text files as strings, CSV/Excel/Parquet with pandas).
+            - Has access to libraries: pandas, numpy, matplotlib, bs4, lxml, duckdb, pyarrow, s3fs, requests, httpx
+            - Produces exactly the final answers in the requested format (JSON array/object). 
+            - For plots: save as PNG, convert to base64 data URI under 100kB, include in JSON response.
             - Prints ONLY the final JSON string to stdout.
-            - Do not require external API keys; no web calls unless explicitly no sourced_data is available.
+            - No external API keys required (except for standard web scraping).
             - Enforce a 120s overall runtime; be efficient.
-            Robustness rules:
-            - Do not assume table positions/names; if parsing HTML in sourced_data, scan all tables and pick by header match/heuristics.
-            - When cleaning currency/number fields, remove all non-digit/decimal characters (e.g., $, commas, NBSP, footnote markers, daggers) and use pd.to_numeric(errors='coerce').
+            
+            Key implementation guidelines:
+            - For web scraping: Use proper User-Agent headers and handle timeouts/redirects gracefully.
+            - For data cleaning: Remove currency symbols, commas, NBSP, footnote markers before converting to numeric.
+            - For HTML parsing: Scan all tables and pick by header matching or content heuristics.
+            - For S3/cloud data: Use s3fs library which is available in the environment.
             - Use deterministic operations (sorted keys/rows) when selecting from ties.
-            - Prefer sourced_data.get('_primary_html') for HTML parsing if present; else choose the first value in sourced_data that looks like HTML.
-            - Treat optional columns like 'Peak' defensively: if absent, compute answers that don't need it and set correlation to null.
+            - Handle missing or malformed data gracefully with appropriate error messages in JSON.
             """
         )
 
@@ -54,6 +64,10 @@ async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | N
         TASK INSTRUCTIONS:\n{task.instructions}\n\nCONTEXT:\n{task.context}
         """
     )
+    
+    # Add feedback if this is a retry
+    if feedback:
+        user += f"\n\nFEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\n\nPlease fix the issues mentioned in the feedback and regenerate the code."
 
     prompt = sys + "\n\n" + user
     code = generate_code(prompt)
@@ -65,10 +79,4 @@ async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | N
     if m:
         code = m[-1]
 
-    # LOGGING CODE: log the full extracted/generated code
-    if logger:
-        try:
-            logger.log(f"Full generated code for {getattr(task, 'id', '?')}:\n" + code)
-        except Exception:
-            pass
     return code

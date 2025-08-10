@@ -19,10 +19,15 @@ dependencies = [
 	"pyarrow>=16.1",
 	"matplotlib>=3.9",
 	"pillow>=10.3",
+	"s3fs>=2024.6.0",
 ]
 
 [tool.uv]
 package = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["logs*", "instructions*"]
 
 [project.scripts]
 start = "app.main:dev"

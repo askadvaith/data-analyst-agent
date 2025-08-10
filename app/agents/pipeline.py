@@ -4,9 +4,8 @@ import time
 from typing import Dict, Any
 from app.utils.logger import LogSession
 
-from app.agents.task_parser import parse_tasks
 from app.agents.coding_agent import generate_code_for_task
-from app.agents.aggregator import aggregate_answers
+from app.agents.validator import validate_output, generate_feedback_for_retry
 from app.core.sandbox import run_python_in_sandbox
 
 
@@ -16,100 +15,171 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
 
     # LOGGING CODE: log pipeline start
     if logger:
-        logger.log("Pipeline start; computing task plan")
+        logger.log("Pipeline start; simplified workflow without task parsing")
+        logger.log(f"Questions length: {len(questions_txt)} chars")
+        logger.log(f"Attachments: {list(attachments.keys())}")
 
-    plan = await parse_tasks(questions_txt, attachments, timeout=remaining(), logger=logger)
+    # Create a single comprehensive task that includes everything
+    task = type("Task", (), {
+        "id": "comprehensive_analysis",
+        "instructions": f"""
+        Analyze the provided questions and data to produce the requested output.
+        
+        USER QUESTIONS:
+        {questions_txt}
+        
+        REQUIREMENTS:
+        - Read and process any provided attachments
+        - Answer all questions in the requested format
+        - If URLs are mentioned, scrape the required data
+        - Generate any requested visualizations as base64 data URIs
+        - Return the final answer as specified in the questions
+        """,
+        "context": {
+            "questions_txt": questions_txt,
+            "attachments": list(attachments.keys())
+        }
+    })()
 
-    # LOGGING CODE: log parsed tasks
-    if logger:
-        try:
-            logger.log("Parsed tasks: " + json.dumps([t.__dict__ for t in plan.tasks])[:1200])
-        except Exception:
-            logger.log("Parsed tasks (non-JSON)")
-
-    task_outputs: Dict[str, Any] = {}
-    sourced_data: Any | None = None
-    # Execute tasks sequentially to keep control on time; force 'source' first if present
-    for idx, task in enumerate(plan.tasks):
-        if remaining() <= 5:
+    max_retries = 3
+    current_code = None
+    
+    for attempt in range(max_retries):
+        if remaining() <= 10:
             break
-        if task.kind == "source":
-            # Generate source code that collects and returns a JSON object with all required datasets
-            instructions = (
-                "Write Python to SOURCE data per instructions. Requirements:\n"
-                "- If URLs are referenced, download the entire HTML/text and include under keys by URL.\n"
-                "- If files are attached (available in attachments dict), read them fully; for tabular files parse with pandas; include raw text too.\n"
-                "- If a database schema is provided, build targeted SELECTs to fetch only relevant data; do not scan entire DB.\n"
-                "- Return a single JSON object mapping source names to contents (strings for HTML/text; JSON arrays/objects for tables).\n"
-                "- Print only the final JSON to stdout."
+            
+        # LOGGING CODE: log attempt
+        if logger:
+            logger.log(f"Code generation attempt {attempt + 1}/{max_retries}")
+        
+        # Generate code (with feedback if this is a retry)
+        feedback = None
+        if attempt > 0 and current_code:
+            # Generate feedback for retry
+            if logger:
+                logger.log("Generating feedback for code regeneration")
+            feedback = await generate_feedback_for_retry(
+                questions_txt, 
+                current_code, 
+                "Previous attempt failed validation or execution",
+                last_result if 'last_result' in locals() else {},
+                attachments,
+                timeout=min(30, remaining()),
+                logger=logger
             )
-            src_task = type("T", (), {"instructions": instructions + "\n\nUSER CONTEXT:\n" + str(task.context), "context": task.context, "id": task.id})
-            code = await generate_code_for_task(src_task, timeout=min(60, remaining()), logger=logger, mode="source")
             if logger:
-                logger.log("Executing source task code")
-            result = await run_python_in_sandbox(code, attachments, questions_txt=questions_txt, sourced_data=None, timeout=min(60, remaining()))
-            task_outputs[task.id] = result
-            # Attempt to parse JSON from stdout into sourced_data
-            try:
-                if isinstance(result, dict) and result.get("stdout_json") is not None:
-                    sourced_data = result.get("stdout_json")
-                else:
-                    import json as _json
-                    sourced_data = _json.loads(result.get("stdout") or "null")
-            except Exception:
-                sourced_data = None
-            # Heuristics: enrich sourced_data with convenience keys for downstream analysis
-            if isinstance(sourced_data, dict):
-                try:
-                    html_candidates = []
-                    text_blobs = []
-                    for k, v in sourced_data.items():
-                        if isinstance(v, str):
-                            lv = v.lower()
-                            if ("<html" in lv) or ("<table" in lv) or ("<div" in lv and "wikitable" in lv):
-                                html_candidates.append(v)
-                            if len(v) > 500:
-                                text_blobs.append(v)
-                    if html_candidates and "_primary_html" not in sourced_data:
-                        sourced_data["_primary_html"] = html_candidates[0]
-                    if text_blobs and "_text_blobs" not in sourced_data:
-                        sourced_data["_text_blobs"] = text_blobs
-                except Exception:
-                    pass
-            if logger:
-                logger.log("Sourced data keys: " + ", ".join(sorted((sourced_data or {}).keys())) if isinstance(sourced_data, dict) else ("type=" + type(sourced_data).__name__))
-            continue
+                logger.log(f"Generated feedback: {feedback[:300]}...")
 
-        if task.kind == "code":
-            code = await generate_code_for_task(task, timeout=min(60, remaining()), logger=logger, mode="code")
+        try:
+            current_code = await generate_code_for_task(
+                task, 
+                timeout=min(60, remaining()), 
+                logger=logger, 
+                mode="code",
+                feedback=feedback
+            )
+            
             # LOGGING CODE: log generated code size
             if logger:
-                logger.log(f"Generated code for {task.id}: {len(code)} bytes")
-            result = await run_python_in_sandbox(code, attachments, questions_txt=questions_txt, sourced_data=sourced_data, timeout=min(60, remaining()))
-            # LOGGING CODE: log sandbox outputs and errors
+                logger.log(f"Generated code: {len(current_code)} chars")
+                logger.log(f"Full generated code:\n{current_code}")
+            
+        except Exception as e:
             if logger:
-                try:
-                    ok = result.get("ok")
-                    stdout = result.get("stdout") or ""
-                    stderr = result.get("stderr") or ""
-                    if ok:
-                        prev = stdout if len(stdout) <= 400 else stdout[:400] + "..."
-                        logger.log(f"Sandbox OK for {task.id}; stdout preview: {prev}")
-                    else:
-                        # LOGGING CODE: include the FULL error message thrown by the generated code (no trimming)
-                        logger.log(f"Sandbox ERROR for {task.id}; stderr (full):\n{stderr}")
-                except Exception:
-                    pass
-            task_outputs[task.id] = result
-        else:
-            # Non-code tasks may be pre-answered by the parser/LLM; keep placeholder
-            task_outputs[task.id] = {"status": "skipped", "reason": "non-code"}
-
-    output = aggregate_answers(plan, task_outputs, attachments, logger=logger)
-    # LOGGING CODE: log full aggregated answer
-    if logger:
+                logger.log(f"Code generation failed: {str(e)}")
+            if attempt == max_retries - 1:
+                return {"error": f"Code generation failed: {str(e)}"}
+            continue
+        
+        # Execute the code
+        if logger:
+            logger.log("Executing generated code in sandbox")
+            
         try:
-            logger.log("Aggregated output (full):\n" + str(output))
-        except Exception:
-            pass
-    return output
+            last_result = await run_python_in_sandbox(
+                current_code, 
+                attachments, 
+                questions_txt=questions_txt, 
+                timeout=min(90, remaining())
+            )
+            
+            # LOGGING CODE: log sandbox execution results
+            if logger:
+                ok = last_result.get("ok", False)
+                stdout = last_result.get("stdout", "")
+                stderr = last_result.get("stderr", "")
+                
+                if ok:
+                    preview = stdout[:400] if len(stdout) <= 400 else stdout[:400] + "..."
+                    logger.log(f"Sandbox execution OK; stdout preview: {preview}")
+                else:
+                    logger.log(f"Sandbox execution ERROR; stderr (full):\n{stderr}")
+                    
+        except Exception as e:
+            if logger:
+                logger.log(f"Sandbox execution failed: {str(e)}")
+            last_result = {"ok": False, "stderr": str(e), "stdout": ""}
+        
+        # Validate the output
+        if last_result.get("ok", False):
+            if logger:
+                logger.log("Validating output against requirements")
+                
+            try:
+                is_valid, validation_feedback = await validate_output(
+                    questions_txt,
+                    current_code,
+                    last_result,
+                    attachments,
+                    timeout=min(30, remaining()),
+                    logger=logger
+                )
+                
+                # LOGGING CODE: log validation results
+                if logger:
+                    logger.log(f"Validation result: {'VALID' if is_valid else 'INVALID'}")
+                    if not is_valid:
+                        logger.log(f"Validation feedback: {validation_feedback}")
+                
+                if is_valid:
+                    # Success! Return the output
+                    output = last_result.get("stdout_json")
+                    if output is None:
+                        try:
+                            output = json.loads(last_result.get("stdout", ""))
+                        except:
+                            output = last_result.get("stdout", "")
+                    
+                    # LOGGING CODE: log successful completion
+                    if logger:
+                        logger.log(f"Pipeline completed successfully on attempt {attempt + 1}")
+                        logger.log(f"Final output: {str(output)[:500]}...")
+                    
+                    return output
+                    
+            except Exception as e:
+                if logger:
+                    logger.log(f"Validation failed: {str(e)}")
+                # If validation fails, treat as invalid and retry
+                
+        # If we reach here, either execution failed or validation failed
+        if attempt == max_retries - 1:
+            # Final attempt failed
+            if logger:
+                logger.log("All attempts exhausted, returning error result")
+            
+            if last_result.get("ok", False):
+                # Execution succeeded but validation failed
+                output = last_result.get("stdout_json")
+                if output is None:
+                    try:
+                        output = json.loads(last_result.get("stdout", ""))
+                    except:
+                        output = {"error": "Could not parse output as JSON", "raw_stdout": last_result.get("stdout", "")}
+                return output
+            else:
+                # Execution failed
+                return {"error": "Code execution failed", "stderr": last_result.get("stderr", ""), "stdout": last_result.get("stdout", "")}
+
+    # Should not reach here, but safety fallback
+    return {"error": "Pipeline failed to complete within time constraints"}

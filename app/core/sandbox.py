@@ -8,7 +8,7 @@ import tempfile
 import os
 
 
-def _build_script(code: str, attachments: Dict[str, bytes], questions_txt: Optional[str], sourced_data: Optional[Any]) -> str:
+def _build_script(code: str, attachments: Dict[str, bytes], questions_txt: Optional[str]) -> str:
     # Construct script via concatenation to avoid .format interfering with user braces
     prefix = (
         "# Auto-generated execution harness\n"
@@ -27,27 +27,12 @@ def _build_script(code: str, attachments: Dict[str, bytes], questions_txt: Optio
             f"_qt_b64 = '{b}'\n"
             "questions_txt = base64.b64decode(_qt_b64).decode('utf-8', 'ignore')\n"
         )
-    sd_section = "\nsourced_data = None\n"
-    if sourced_data is not None:
-        try:
-            import json as _json
-            sd_json = _json.dumps(sourced_data)
-        except Exception:
-            sd_json = "null"
-        # Use base64 to avoid quoting issues in large JSON strings
-        import base64 as _b64
-        sd_b64 = _b64.b64encode(sd_json.encode('utf-8')).decode('ascii')
-        sd_section = (
-            "\n# Inject sourced_data (JSON-deserialized)\n"
-            f"_sd_b64 = '{sd_b64}'\n"
-            "sourced_data = json.loads(base64.b64decode(_sd_b64).decode('utf-8', 'ignore'))\n"
-        )
     start = "\n\n# User code starts\n"
-    return prefix + inject + q_section + sd_section + start + code + "\n"
+    return prefix + inject + q_section + start + code + "\n"
 
 
-async def run_python_in_sandbox(code: str, attachments: Dict[str, bytes], questions_txt: Optional[str] = None, sourced_data: Optional[Any] = None, timeout: int = 60) -> Dict[str, Any]:
-    script = _build_script(code, attachments, questions_txt, sourced_data)
+async def run_python_in_sandbox(code: str, attachments: Dict[str, bytes], questions_txt: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
+    script = _build_script(code, attachments, questions_txt)
 
     # Execute via blocking subprocess.run inside a worker thread for broad Windows compatibility.
     # Write the script to a temporary file to avoid Windows command-line length limits with `-c`.
