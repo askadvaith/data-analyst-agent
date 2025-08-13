@@ -36,3 +36,11 @@ def dev():
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True)
+
+
+if __name__ == "__main__":
+    # This will run when the file is executed directly (e.g., python app/main.py)
+    import uvicorn
+    
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=False)
