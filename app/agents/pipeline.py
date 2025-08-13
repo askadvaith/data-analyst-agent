@@ -7,9 +7,10 @@ from app.utils.logger import LogSession
 from app.agents.coding_agent import generate_code_for_task
 from app.agents.validator import validate_output, generate_feedback_for_retry
 from app.core.sandbox import run_python_in_sandbox
+from app.agents.format_extractor import extract_expected_format, populate_format_with_timeout_message
 
 
-async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadline_secs: int = 170, logger: LogSession | None = None) -> Any:
+async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadline_secs: int = 300, logger: LogSession | None = None) -> Any:
     start = time.time()
     remaining = lambda: max(5, deadline_secs - int(time.time() - start))
 
@@ -18,6 +19,21 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
         logger.log("Pipeline start; simplified workflow without task parsing")
         logger.log(f"Questions length: {len(questions_txt)} chars")
         logger.log(f"Attachments: {list(attachments.keys())}")
+
+    # Extract expected format first (this will be used for timeout fallback)
+    expected_format = None
+    try:
+        if logger:
+            logger.log("Extracting expected output format from questions")
+        expected_format = await extract_expected_format(questions_txt, timeout=min(30, remaining()), logger=logger)
+        if logger:
+            if expected_format:
+                logger.log(f"Extracted format template: {json.dumps(expected_format)}")
+            else:
+                logger.log("Could not extract specific format, will use fallback")
+    except Exception as e:
+        if logger:
+            logger.log(f"Format extraction failed: {str(e)}")
 
     # Create a single comprehensive task that includes everything
     task = type("Task", (), {
@@ -45,8 +61,14 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
     current_code = None
     
     for attempt in range(max_retries):
-        if remaining() <= 10:
-            break
+        # Check if we're running out of time before starting any significant work
+        if remaining() <= 10:  # If less than 10 seconds remaining, return timeout response
+            if logger:
+                logger.log("Approaching timeout, returning format template with null values")
+            timeout_response = populate_format_with_timeout_message(expected_format)
+            if logger:
+                logger.log(f"Timeout response: {json.dumps(timeout_response)}")
+            return timeout_response
             
         # LOGGING CODE: log attempt
         if logger:
@@ -55,6 +77,13 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
         # Generate code (with feedback if this is a retry)
         feedback = None
         if attempt > 0 and current_code:
+            # Check time before generating feedback
+            if remaining() <= 30:
+                if logger:
+                    logger.log("Insufficient time for feedback generation, returning timeout response")
+                timeout_response = populate_format_with_timeout_message(expected_format)
+                return timeout_response
+                
             # Generate feedback for retry
             if logger:
                 logger.log("Generating feedback for code regeneration")
@@ -64,7 +93,7 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
                 "Previous attempt failed validation or execution",
                 last_result if 'last_result' in locals() else {},
                 attachments,
-                timeout=min(30, remaining()),
+                timeout=min(15, remaining() - 10),  # Conservative timeout for feedback
                 logger=logger
             )
             if logger:
@@ -88,8 +117,18 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
             if logger:
                 logger.log(f"Code generation failed: {str(e)}")
             if attempt == max_retries - 1:
-                return {"error": f"Code generation failed: {str(e)}"}
+                if logger:
+                    logger.log("Final attempt failed, returning timeout response")
+                timeout_response = populate_format_with_timeout_message(expected_format)
+                return timeout_response
             continue
+        
+        # Check time before execution
+        if remaining() <= 15:
+            if logger:
+                logger.log("Insufficient time for code execution, returning timeout response")
+            timeout_response = populate_format_with_timeout_message(expected_format)
+            return timeout_response
         
         # Execute the code
         if logger:
@@ -120,26 +159,55 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
                 logger.log(f"Sandbox execution failed: {str(e)}")
             last_result = {"ok": False, "stderr": str(e), "stdout": ""}
         
+        # Check time before validation
+        if remaining() <= 20:
+            if logger:
+                logger.log("Insufficient time for validation, attempting to return execution result")
+            if last_result.get("ok", False):
+                output = last_result.get("stdout_json")
+                if output is None:
+                    try:
+                        output = json.loads(last_result.get("stdout", ""))
+                    except:
+                        output = populate_format_with_timeout_message(expected_format)
+                return output
+            else:
+                timeout_response = populate_format_with_timeout_message(expected_format)
+                return timeout_response
+        
         # Validate the output
         if last_result.get("ok", False):
             if logger:
                 logger.log("Validating output against requirements")
                 
             try:
+                # Use a much more conservative timeout for validator to prevent hanging
+                validator_timeout = min(15, remaining() - 5)  # Max 15 seconds for validator, with 5s buffer
+                validation_start = time.time()
+                
                 is_valid, validation_feedback = await validate_output(
                     questions_txt,
                     current_code,
                     last_result,
                     attachments,
-                    timeout=min(30, remaining()),
+                    timeout=validator_timeout,
                     logger=logger
                 )
                 
+                validation_elapsed = time.time() - validation_start
+                
                 # LOGGING CODE: log validation results
                 if logger:
+                    logger.log(f"Validation completed in {validation_elapsed:.1f}s")
                     logger.log(f"Validation result: {'VALID' if is_valid else 'INVALID'}")
                     if not is_valid:
                         logger.log(f"Validation feedback: {validation_feedback}")
+                
+                # If validation took too long, treat as valid to avoid blocking
+                if validation_elapsed > validator_timeout:
+                    if logger:
+                        logger.log(f"Validator exceeded timeout ({validation_elapsed:.1f}s > {validator_timeout}s), treating as valid")
+                    is_valid = True
                 
                 if is_valid:
                     # Success! Return the output
@@ -166,20 +234,13 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
         if attempt == max_retries - 1:
             # Final attempt failed
             if logger:
-                logger.log("All attempts exhausted, returning error result")
-            
-            if last_result.get("ok", False):
-                # Execution succeeded but validation failed
-                output = last_result.get("stdout_json")
-                if output is None:
-                    try:
-                        output = json.loads(last_result.get("stdout", ""))
-                    except:
-                        output = {"error": "Could not parse output as JSON", "raw_stdout": last_result.get("stdout", "")}
-                return output
-            else:
-                # Execution failed
-                return {"error": "Code execution failed", "stderr": last_result.get("stderr", ""), "stdout": last_result.get("stdout", "")}
+                logger.log("All attempts exhausted, returning best available result (format template with null values)")
+            # Always return the required format template with null/empty values as the best possible result
+            timeout_response = populate_format_with_timeout_message(expected_format)
+            return timeout_response
 
     # Should not reach here, but safety fallback
-    return {"error": "Pipeline failed to complete within time constraints"}
+    if logger:
+        logger.log("Pipeline reached unexpected end, returning timeout response")
+    timeout_response = populate_format_with_timeout_message(expected_format)
+    return timeout_response

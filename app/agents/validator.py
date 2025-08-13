@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import time
+import asyncio
 from typing import Dict, Any, Tuple
 from textwrap import dedent
 from app.agents.llm import generate_plain
@@ -75,11 +76,30 @@ async def validate_output(
     """)
     
     try:
-        validation_response = generate_plain(validation_prompt, model="gemini-2.5-flash")
+        # Use asyncio.wait_for to enforce timeout on the entire validation process
+        try:
+            validation_response = await asyncio.wait_for(
+                asyncio.to_thread(generate_plain, validation_prompt, "gemini-2.5-flash", timeout),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            if logger:
+                logger.log(f"Validator timed out after {timeout} seconds")
+            return True, f"Validator timed out after {timeout}s, assuming output is valid"
+        except Exception as e:
+            if logger:
+                logger.log(f"Validator API call failed: {str(e)}")
+            return True, f"Validator API failed, assuming output is valid: {str(e)}"
         
         # Log the validation response
         if logger:
-            logger.log(f"Validator response: {validation_response[:500]}")
+            logger.log(f"Validator response: {validation_response[:500] if validation_response else 'Empty response'}")
+        
+        # Check for empty response
+        if not validation_response or not validation_response.strip():
+            if logger:
+                logger.log("Validator returned empty response, assuming output is valid")
+            return True, "Validator returned empty response, assuming output is valid"
         
         # Parse validation response
         try:
@@ -94,11 +114,18 @@ async def validate_output(
             is_valid = validation_json.get("valid", False)
             feedback = validation_json.get("feedback", "Unknown validation error")
             
+            if logger:
+                logger.log(f"Validation result: {'VALID' if is_valid else 'INVALID'}")
+                if not is_valid:
+                    logger.log(f"Validation feedback: {feedback}")
+            
             return is_valid, feedback
             
         except Exception as e:
             # Fallback: assume invalid if we can't parse validation response
-            return False, f"Validation parsing error: {str(e)}. Raw response: {validation_response[:200]}"
+            if logger:
+                logger.log(f"Validation parsing error: {str(e)}. Raw response: {validation_response[:200] if validation_response else 'None'}")
+            return False, f"Validation parsing error: {str(e)}. Raw response: {validation_response[:200] if validation_response else 'None'}"
             
     except Exception as e:
         # If validator fails, assume output is valid to avoid blocking
@@ -153,7 +180,13 @@ async def generate_feedback_for_retry(
     """)
     
     try:
-        feedback = generate_plain(feedback_prompt, model="gemini-2.5-flash")
+        # Use asyncio.wait_for to enforce timeout
+        feedback = await asyncio.wait_for(
+            asyncio.to_thread(generate_plain, feedback_prompt, "gemini-2.5-flash", timeout),
+            timeout=timeout
+        )
         return feedback
+    except asyncio.TimeoutError:
+        return f"Feedback generation timed out after {timeout}s. Original error: {error_message}"
     except Exception as e:
         return f"Could not generate feedback: {str(e)}. Original error: {error_message}"

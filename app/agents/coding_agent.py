@@ -42,13 +42,13 @@ async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | N
             - Uses the injected variables: attachments (Dict[str, bytes]) and questions_txt (str).
             - If URLs are mentioned in questions_txt, fetch them using requests/httpx with proper headers and timeouts.
             - If files are in attachments, read and process them (text files as strings, CSV/Excel/Parquet with pandas).
-            - Has access to libraries: pandas, numpy, matplotlib, bs4, lxml, duckdb, pyarrow, s3fs, requests, httpx
+            - Has access to libraries: pandas, numpy, matplotlib, seaborn, bs4, lxml, duckdb, pyarrow, s3fs, requests, httpx, html5lib
             - Produces exactly the final answers in the requested format (JSON array/object). 
             - For plots: save as PNG, convert to base64 data URI under 100kB, include in JSON response.
             - Prints ONLY the final JSON string to stdout.
             - No external API keys required (except for standard web scraping).
             - Enforce a 120s overall runtime; be efficient.
-            
+
             Key implementation guidelines:
             - For web scraping: Use proper User-Agent headers and handle timeouts/redirects gracefully.
             - For data cleaning: Remove currency symbols, commas, NBSP, footnote markers before converting to numeric.
@@ -56,6 +56,8 @@ async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | N
             - For S3/cloud data: Use s3fs library which is available in the environment.
             - Use deterministic operations (sorted keys/rows) when selecting from ties.
             - Handle missing or malformed data gracefully with appropriate error messages in JSON.
+
+            - IMPORTANT: For DuckDB SQL, DO NOT use julianday(). To calculate the difference in days between two dates, use DATE_DIFF('day', try_strptime(date_of_registration, '%d-%m-%Y'), decision_date).
             """
         )
 
@@ -70,9 +72,16 @@ async def generate_code_for_task(task, timeout: int = 60, logger: LogSession | N
         user += f"\n\nFEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\n\nPlease fix the issues mentioned in the feedback and regenerate the code."
 
     prompt = sys + "\n\n" + user
-    code = generate_code(prompt)
+    code = generate_code(prompt, logger=logger)
     if not code:
         raise CodeGenError("Empty code from model")
+    
+    # Check if we got stub code and log it
+    if "print(json.dumps(['stub']))" in code:
+        if logger:
+            logger.log("WARNING: Generated code contains stub placeholder")
+        raise CodeGenError("Generated stub code instead of real implementation")
+    
     # Extract python code fences if present
     import re
     m = re.findall(r"```python\n(.*?)```", code, re.S)

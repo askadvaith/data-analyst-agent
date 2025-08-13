@@ -1,7 +1,7 @@
 Data Analyst Agent API
 ======================
 
-FastAPI service that accepts multipart POST with `questions.txt` and optional attachments, plans tasks with Gemini, generates Python code to execute analysis in a sandbox, and returns answers in the requested JSON format within ~3 minutes.
+FastAPI service that accepts multipart POST with `questions.txt` and optional attachments, plans tasks with Gemini, generates Python code to execute analysis in a sandbox, and returns answers in the requested JSON format within ~5 minutes.
 
 Quick start (local)
 -------------------

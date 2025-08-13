@@ -10,6 +10,10 @@ from app.utils.logger import new_log_session
 
 router = APIRouter()
 
+# Health check route for GET requests
+@router.get("/health")
+async def health_check():
+    return {"status": "ok", "message": "API is healthy"}
 
 @router.post("/")
 async def analyze(request: Request):
@@ -68,7 +72,7 @@ async def analyze(request: Request):
         # LOGGING CODE: log a short preview of questions
         log.log("questions.txt preview: " + questions[:300].replace("\n", " "))
 
-        result = await run_pipeline(questions, attachments, deadline_secs=170, logger=log)  # leave buffer under 3 minutes
+        result = await run_pipeline(questions, attachments, deadline_secs=290, logger=log)  # 280s to leave 20s buffer under 5 minutes
         # LOGGING CODE: log final result (full)
         try:
             log.log("Final result (full):\n" + str(result))
