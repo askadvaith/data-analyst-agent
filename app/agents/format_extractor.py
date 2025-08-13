@@ -25,26 +25,30 @@ async def extract_expected_format(
     
     # Use LLM to analyze the questions and determine the expected format
     format_prompt = dedent(f"""
-    Analyze the following questions and determine the EXACT output format that is expected.
-    Look for specific mentions of:
-    - JSON arrays
-    - JSON objects  
-    - Specific field names
-    - Number of items expected
-    - Data types (strings, numbers, booleans)
-    - Nested structures
-    
-    Return a JSON template that matches the expected format, but with null/empty values as placeholders.
-    
-    For example:
-    - If questions ask for "JSON array of 3 strings" → return ["", "", ""]
-    - If questions ask for "JSON object with name and age" → return {{"name": "", "age": null}}
-    - If questions ask for "array of objects with id and value" → return [{{"id": null, "value": ""}}]
-    
+    Analyze the following questions and determine the EXACT JSON output format that is expected.
+    Identify:
+    - Whether output is an object or array
+    - Field names and their primitive / nested data types
+    - Repeated record structure (arrays of objects)
+    - Approximate number of elements if explicitly stated (retain representative single element only)
+
+    Return a JSON TEMPLATE using DEFAULT TYPED PLACEHOLDERS:
+    - string -> "default"
+    - integer/float -> 0 (use 0 for all numerics)
+    - boolean -> false
+    - null / unknown -> "default"
+    - array -> one representative element only (do not repeat 3 times unless explicitly distinct)
+    - object -> include all keys with placeholder values recursively
+
+    Examples:
+    - "JSON array of 3 strings" => ["default", "default", "default"] (if count explicitly specified)
+    - "JSON object with name and age" => {"name": "default", "age": 0}
+    - "Array of objects with id and value" => [{"id": 0, "value": "default"}]
+
     QUESTIONS:
     {questions_txt}
-    
-    Respond with ONLY the JSON template (no explanation). If you cannot determine a specific format, respond with null.
+
+    Respond with ONLY the JSON template (no explanation). If format cannot be determined, respond with {"result": "default"}.
     """)
     
     try:
@@ -110,10 +114,19 @@ async def extract_expected_format(
 
 
 def create_fallback_format() -> Dict[str, Any]:
-    """
-    Create a generic fallback format when format extraction fails.
-    """
-    return {"error": "Request timed out", "result": None}
+    return {"error": "timeout", "result": "default"}
+
+
+def _default_for(value):
+    if isinstance(value, str):
+        return "default"
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return 0
+    if value is None:
+        return "default"
+    return "default"
 
 
 def populate_format_with_timeout_message(format_template: Any) -> Any:
@@ -131,26 +144,18 @@ def populate_format_with_timeout_message(format_template: Any) -> Any:
     
     def fill_template(obj):
         if isinstance(obj, dict):
-            result = {}
-            for key, value in obj.items():
-                if isinstance(value, (dict, list)):
-                    result[key] = fill_template(value)
-                elif value is None:
-                    result[key] = None
-                elif isinstance(value, str) and value == "":
-                    result[key] = ""
-                elif isinstance(value, (int, float)) and value == 0:
-                    result[key] = 0
+            out = {}
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    out[k] = fill_template(v)
                 else:
-                    result[key] = fill_template(value)
-            return result
-        elif isinstance(obj, list):
-            if len(obj) == 0:
+                    out[k] = _default_for(v)
+            return out
+        if isinstance(obj, list):
+            if not obj:
                 return []
-            # Fill each item in the list
-            return [fill_template(item) for item in obj]
-        else:
-            # For primitive values, return as-is (they're already null/empty placeholders)
-            return obj
+            # single representative element (recursively defaulted)
+            return [fill_template(obj[0])]
+        return _default_for(obj)
     
     return fill_template(format_template)

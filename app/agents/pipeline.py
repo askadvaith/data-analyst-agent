@@ -64,7 +64,7 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
         # Check if we're running out of time before starting any significant work
         if remaining() <= 10:  # If less than 10 seconds remaining, return timeout response
             if logger:
-                logger.log("Approaching timeout, returning format template with null values")
+                logger.log("Approaching timeout, returning format template with default typed values")
             timeout_response = populate_format_with_timeout_message(expected_format)
             if logger:
                 logger.log(f"Timeout response: {json.dumps(timeout_response)}")
@@ -234,7 +234,7 @@ async def run_pipeline(questions_txt: str, attachments: Dict[str, bytes], deadli
         if attempt == max_retries - 1:
             # Final attempt failed
             if logger:
-                logger.log("All attempts exhausted, returning best available result (format template with null values)")
+                logger.log("All attempts exhausted, returning best available result (format template with default typed values)")
             # Always return the required format template with null/empty values as the best possible result
             timeout_response = populate_format_with_timeout_message(expected_format)
             return timeout_response
